@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+env/
+venv/
+
+# Environment Variables (Secrets)
+.env
+
+# Logs and Results
+logs/
+wandb/
+*.log
+
+# Data
+data/
+*.parquet
+*.jsonl
+*.json
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store

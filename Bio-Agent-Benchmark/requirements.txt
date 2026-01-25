@@ -1,0 +1,12 @@
+datasets
+pandas
+pyyaml
+fire
+python-dotenv
+wandb
+mlflow
+tqdm
+tenacity
+pytest
+protobuf>=5.0
+openai

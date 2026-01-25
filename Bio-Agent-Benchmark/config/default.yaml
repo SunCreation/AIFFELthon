@@ -1,0 +1,16 @@
+# 실험 설정
+experiment:
+  name: "biomni-eval-test"
+  use_mlflow: true
+  use_wandb: false
+
+# 벤치마크 설정
+benchmarks:
+  - mock
+  # - biomni
+  # - labbench
+
+# 로깅
+logging:
+  level: INFO
+  save_dir: "./logs"
