@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 class LabBenchBenchmark(BaseBenchmark):
     DATASET_ID = "futurehouse/lab-bench"
-    # 실제 로드 가능한 서브셋 목록 (일부 서브셋은 구조가 다를 수 있으나, 일단 시도)
     AVAILABLE_SUBSETS = [
         "LitQA2",
         "DbQA",
@@ -27,11 +26,7 @@ class LabBenchBenchmark(BaseBenchmark):
     ]
 
     def __init__(self, subset: str = "all"):
-        """
-        Args:
-            subset: 특정 서브셋 이름 또는 'all' (모든 서브셋 로드)
-        """
-        self.df = None  # 단일 DF로 관리하기 어려우므로 tasks 리스트 생성에 집중
+        self.df = None
         self.tasks = []
         self.target_subsets = self.AVAILABLE_SUBSETS if subset == "all" else [subset]
 
@@ -46,8 +41,6 @@ class LabBenchBenchmark(BaseBenchmark):
             try:
                 from datasets import load_dataset
 
-                # split='train'을 명시하여 Dataset 객체 반환 유도
-                # trust_remote_code=True는 필요 시 추가, 현재 버전은 불필요 확인됨
                 ds = load_dataset(self.DATASET_ID, sub, split="train")
 
                 if hasattr(ds, "to_pandas"):
@@ -55,15 +48,13 @@ class LabBenchBenchmark(BaseBenchmark):
                 else:
                     df = pd.DataFrame(ds)
 
-                # 서브셋별 태스크 변환
                 subset_tasks = self._convert_df_to_tasks(df, sub)
                 all_tasks.extend(subset_tasks)
                 logger.info(f"Loaded {len(subset_tasks)} tasks from {sub}")
 
             except Exception as e:
                 logger.error(f"Failed to load subset {sub}: {e}")
-                # Mock 데이터 추가 (테스트용)
-                if sub == "LitQA2":  # 대표 서브셋 실패시에만 Mock 추가
+                if sub == "LitQA2":
                     logger.info("Adding MOCK data for verification.")
                     mock_df = pd.DataFrame(
                         [
@@ -89,7 +80,6 @@ class LabBenchBenchmark(BaseBenchmark):
             return tasks
 
         for idx, row in df.iterrows():
-            # 옵션 가져오기 및 None 처리
             distractors = row.get("distractors", [])
             if hasattr(distractors, "tolist"):
                 options = distractors.tolist()
@@ -99,19 +89,15 @@ class LabBenchBenchmark(BaseBenchmark):
                 options = []
 
             ideal = row.get("ideal", "")
-
-            # 옵션 합치기
             all_options: List[str] = options + [str(ideal)]
             np.random.shuffle(all_options)
 
-            # 정답 인덱스 찾기
             try:
                 answer_idx = all_options.index(str(ideal))
                 answer_letter = chr(ord("A") + answer_idx)
             except ValueError:
                 continue
 
-            # 프롬프트 구성
             options_text = "\n".join(
                 [f"{chr(ord('A') + i)}. {opt}" for i, opt in enumerate(all_options)]
             )
@@ -125,7 +111,7 @@ class LabBenchBenchmark(BaseBenchmark):
 
             task = {
                 "id": task_id,
-                "task_name": f"lab_bench_{subset_name}",  # 카테고리 식별자
+                "task_name": f"lab_bench_{subset_name}",
                 "prompt": prompt,
                 "ground_truth": answer_letter,
                 "options": all_options,
@@ -164,10 +150,7 @@ class LabBenchBenchmark(BaseBenchmark):
         total = 0
         correct = 0
 
-        # 전체 정확도 외에 서브셋별 정확도도 계산할 수 있지만,
-        # BaseBenchmark 인터페이스는 Dict[str, float] 반환이므로
-        # analyzer가 메타데이터 기반으로 상세 분석하도록 함.
-        # 여기서는 전체 Accuracy만 반환.
+        subset_stats = {}
 
         for pred in predictions:
             if pred["status"] != "success":
@@ -185,9 +168,31 @@ class LabBenchBenchmark(BaseBenchmark):
 
             gt = str(pred["ground_truth"]).strip().upper()
 
-            if user_response == gt:
+            is_correct = user_response == gt
+
+            if is_correct:
                 correct += 1
             total += 1
 
-        accuracy = correct / total if total > 0 else 0.0
-        return {"accuracy": accuracy}
+            # 서브셋별 통계 집계
+            meta = pred.get("metadata", {})
+            subset = meta.get("subset", "unknown")
+
+            if subset not in subset_stats:
+                subset_stats[subset] = {"total": 0, "correct": 0}
+            subset_stats[subset]["total"] += 1
+            if is_correct:
+                subset_stats[subset]["correct"] += 1
+
+        metrics = {}
+        metrics["accuracy"] = correct / total if total > 0 else 0.0
+
+        # DEBUG LOG
+        logger.info(f"Subset Stats Collected: {subset_stats}")
+
+        for sub, stats in subset_stats.items():
+            metrics[f"accuracy_{sub}"] = (
+                stats["correct"] / stats["total"] if stats["total"] > 0 else 0.0
+            )
+
+        return metrics
