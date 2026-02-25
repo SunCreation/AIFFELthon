@@ -19,8 +19,7 @@ from collections import defaultdict
 from datetime import datetime
 
 
-def parse_log_line(line):
-    # type: (str) -> Optional[dict]
+def parse_log_line(line: str) -> Optional[dict]:
     """로그 한 줄을 파싱하여 이벤트 딕셔너리 반환."""
 
     # [REQ] task=gwas_134 | worker=Thread-1 | prompt_chars=1523 | mode=stream
@@ -49,10 +48,10 @@ def parse_log_line(line):
             "ttft": float(stream_start_match.group(3)),
         }
 
-    # [STREAM_PROGRESS] task=gwas_134 | worker=Thread-1 | tokens_so_far=20 | elapsed=3.5s
+    # [STREAM_PROGRESS] task=gwas_134 | worker=Thread-1 | tokens_so_far=20 | reasoning=15 | elapsed=3.5s
     stream_progress_match = re.search(
         r"\[STREAM_PROGRESS\] task=(\S+) \| worker=(\S+) \| "
-        r"tokens_so_far=(\d+) \| elapsed=([\d.]+)s",
+        r"tokens_so_far=(\d+) \| (?:reasoning=(\d+) \| )?elapsed=([\d.]+)s",
         line,
     )
     if stream_progress_match:
@@ -61,7 +60,8 @@ def parse_log_line(line):
             "task_id": stream_progress_match.group(1),
             "worker": stream_progress_match.group(2),
             "tokens_so_far": int(stream_progress_match.group(3)),
-            "elapsed": float(stream_progress_match.group(4)),
+            "reasoning_tokens": int(stream_progress_match.group(4)) if stream_progress_match.group(4) else 0,
+            "elapsed": float(stream_progress_match.group(5)),
         }
 
     # [STREAM_STALL] task=hle_55 | worker=Thread-3 | last_token_age=60.0s | tokens_so_far=12
@@ -76,14 +76,15 @@ def parse_log_line(line):
     stream_end_match = re.search(
         r"\[STREAM_END\] task=(\S+) \| worker=(\S+) \| "
         r"total_tokens=(\d+) \| "
+        r"(?:reasoning_tokens=(\d+) \| )?"
         r"(?:prompt_tokens=([^|]+) \| )?"
         r"(?:ttft=([\d.-]+)s \| )?"
         r"latency=([\d.]+)s \| answer=(.*)",
         line,
     )
     if stream_end_match:
-        prompt_tokens_raw = stream_end_match.group(4)
-        ttft_str = stream_end_match.group(5)
+        prompt_tokens_raw = stream_end_match.group(5)
+        ttft_str = stream_end_match.group(6)
         prompt_tokens_val = None
         if prompt_tokens_raw:
             stripped = prompt_tokens_raw.strip()
@@ -92,15 +93,17 @@ def parse_log_line(line):
         ttft_val = None
         if ttft_str and ttft_str != "-1":
             ttft_val = float(ttft_str)
+        reasoning_str = stream_end_match.group(4)
         return {
             "event": "stream_end",
             "task_id": stream_end_match.group(1),
             "worker": stream_end_match.group(2),
             "total_tokens": int(stream_end_match.group(3)),
+            "reasoning_tokens": int(reasoning_str) if reasoning_str else 0,
             "prompt_tokens": prompt_tokens_val,
             "ttft": ttft_val,
-            "latency": float(stream_end_match.group(6)),
-            "answer": stream_end_match.group(7).strip(),
+            "latency": float(stream_end_match.group(7)),
+            "answer": stream_end_match.group(8).strip(),
         }
 
     # [RES] (non-streaming mode) task=gwas_134 | worker=Thread-1 | latency=3.2s | ...
@@ -136,6 +139,21 @@ def parse_log_line(line):
             "error": err_match.group(4).strip(),
         }
 
+
+    # [SCORE] task=gwas_variant_prioritization_134 | score=1.0 | prediction=rs4253311 | ground_truth=rs4253311
+    score_match = re.search(
+        r"\[SCORE\] task=(\S+) \| score=([\d.]+) \| prediction=(.*?) \| ground_truth=(.*)",
+        line,
+    )
+    if score_match:
+        return {
+            "event": "score",
+            "task_id": score_match.group(1),
+            "score": float(score_match.group(2)),
+            "prediction": score_match.group(3).strip(),
+            "ground_truth": score_match.group(4).strip(),
+        }
+
     # tqdm progress: Running tasks (x4):  25%|...| 108/433 [05:23<15:02, 2.78s/it]
     tqdm_match = re.search(r"(\d+)/(\d+) \[(\S+)<(\S+)", line)
     if tqdm_match:
@@ -153,23 +171,26 @@ def parse_log_line(line):
 class Monitor:
     def __init__(self):
         # worker -> {task_id, start_time, prompt_chars, tokens, status, ttft}
-        self.active_tasks = {}  # type: dict
+        self.active_tasks = {}
         self.completed = 0
         self.errors = 0
         self.stalls = 0
         self.total_tasks = 0
-        self.latencies = []  # type: list
-        self.ttfts = []  # type: list
+        self.latencies = []
+        self.ttfts = []
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.task_type_stats = defaultdict(lambda: {"count": 0, "total_latency": 0.0})
         self.start_time = time.time()
         self.last_progress = ""
         self.slowest_task = ("", 0.0)
-        self.error_list = []  # type: list
+        self.error_list = []
+        # Accuracy tracking
+        self.correct_count = 0
+        self.total_scored = 0
+        self.task_type_accuracy = defaultdict(lambda: {"correct": 0, "total": 0})
 
     def process_event(self, event):
-        # type: (dict) -> None
         evt = event["event"]
 
         if evt == "req":
@@ -178,6 +199,7 @@ class Monitor:
                 "start_time": time.time(),
                 "prompt_chars": event["prompt_chars"],
                 "tokens": 0,
+                "reasoning_tokens": 0,
                 "status": "waiting",  # waiting -> generating -> done
                 "ttft": None,
                 "mode": event.get("mode", "unknown"),
@@ -193,6 +215,7 @@ class Monitor:
             worker_info = self.active_tasks.get(event["worker"])
             if worker_info:
                 worker_info["tokens"] = event["tokens_so_far"]
+                worker_info["reasoning_tokens"] = event.get("reasoning_tokens", 0)
                 worker_info["status"] = "generating"
 
         elif evt == "stream_stall":
@@ -258,8 +281,21 @@ class Monitor:
                 event["remaining"],
             )
 
+
+        elif evt == "score":
+            self.total_scored += 1
+            is_correct = event["score"] >= 1.0
+            if is_correct:
+                self.correct_count += 1
+            task_type = (
+                event["task_id"].rsplit("_", 1)[0]
+                if "_" in event["task_id"]
+                else event["task_id"]
+            )
+            self.task_type_accuracy[task_type]["total"] += 1
+            if is_correct:
+                self.task_type_accuracy[task_type]["correct"] += 1
     def render(self):
-        # type: () -> str
         elapsed = time.time() - self.start_time
         avg_latency = sum(self.latencies) / len(self.latencies) if self.latencies else 0
         avg_ttft = sum(self.ttfts) / len(self.ttfts) if self.ttfts else 0
@@ -306,11 +342,7 @@ class Monitor:
             "  ⏱  Avg latency: %.1fs  |  Slowest: %s (%.1fs)"
             % (avg_latency, self.slowest_task[0], self.slowest_task[1])
         )
-        if self.ttfts:
-            lines.append(
-                "  ⚡ Avg TTFT: %.2fs  |  Min: %.2fs  |  Max: %.2fs"
-                % (avg_ttft, min(self.ttfts), max(self.ttfts))
-            )
+        lines.append("  ⚡ Avg TTFT: %.2fs" % avg_ttft)
         lines.append(
             "  📊 Tokens — completion: %s  |  prompt: %s"
             % (
@@ -342,19 +374,13 @@ class Monitor:
                 worker_short = worker.split("_")[-1] if "_" in worker else worker
 
                 if status_str == "generating":
-                    ttft_str = (
-                        "ttft=%.1fs, " % info["ttft"]
-                        if info.get("ttft") is not None
-                        else ""
-                    )
                     lines.append(
-                        "    %s %s: %s — %.0fs, %s%d tokens, generating..."
+                        "    %s %s: %s — %.0fs, %d tokens, generating..."
                         % (
                             icon,
                             worker_short,
                             info["task_id"],
                             running_for,
-                            ttft_str,
                             tokens,
                         )
                     )
@@ -401,7 +427,6 @@ class Monitor:
 
 
 def tail_and_monitor(filepath, refresh=3.0):
-    # type: (str, float) -> None
     """로그 파일을 tail -f 하면서 모니터링."""
     monitor = Monitor()
 

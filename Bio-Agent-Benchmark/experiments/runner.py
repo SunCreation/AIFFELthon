@@ -189,10 +189,36 @@ class ExperimentRunner:
     ) -> List[Dict[str, Any]]:
         """병렬 실행 (ThreadPoolExecutor)"""
 
+        def _compute_score_inline(result_dict: Dict[str, Any]) -> float:
+            task_name = result_dict.get("metadata", {}).get("task_name", "unknown")
+            pred = result_dict.get("prediction", "")
+            gt = result_dict.get("ground_truth", "")
+            sc = 0.0
+            if isinstance(benchmark, BiomniBenchmark):
+                sc = benchmark._compute_reward(task_name, pred, gt)
+            elif isinstance(benchmark, LabBenchBenchmark):
+                p_text = str(pred).strip().upper()
+                if "ANSWER:" in p_text:
+                    p_text = p_text.split("ANSWER:")[-1].strip()
+                p_char = (
+                    p_text[0] if len(p_text) > 0 and "A" <= p_text[0] <= "Z" else ""
+                )
+                sc = 1.0 if p_char == str(gt).strip().upper() else 0.0
+            return sc
         def _execute_task(task: Dict[str, Any]) -> Dict[str, Any]:
             task_start = time.time()
             result_dict = benchmark.run_task(agent, task)
             result_dict["execution_time"] = time.time() - task_start
+            sc = _compute_score_inline(result_dict)
+            result_dict["score"] = sc
+            task_id = result_dict.get("task_id", "unknown")
+            logger.info(
+                "[SCORE] task=%s | score=%.1f | prediction=%s | ground_truth=%s",
+                task_id,
+                sc,
+                str(result_dict.get("prediction", ""))[:60],
+                str(result_dict.get("ground_truth", ""))[:60],
+            )
             return result_dict
         task_results = []
         errors = 0

@@ -105,9 +105,11 @@ class LLMAgent:
             content_parts = []
             reasoning_parts = []
             token_count = 0
+            reasoning_count = 0
             ttft = None  # type: Optional[float]
             last_token_time = start
-            progress_interval = 10
+            progress_interval = 1
+            next_progress_log = progress_interval
             stream_events = queue.Queue()
 
             def _consume_stream() -> None:
@@ -158,7 +160,7 @@ class LLMAgent:
 
                 if reasoning_content:
                     reasoning_parts.append(reasoning_content)
-
+                    reasoning_count += 1
                 if content:
                     content_parts.append(content)
                     token_count += 1
@@ -175,16 +177,19 @@ class LLMAgent:
                             ttft,
                         )
 
-                if token_count > 0 and token_count % progress_interval == 0:
+                total_active = reasoning_count + token_count
+                if total_active >= next_progress_log:
                     elapsed = time.time() - start
                     logger.info(
                         "[STREAM_PROGRESS] task=%s | worker=%s | "
-                        "tokens_so_far=%d | elapsed=%.1fs",
+                        "tokens_so_far=%d | reasoning=%d | elapsed=%.1fs",
                         task_id,
                         worker_id,
-                        token_count,
+                        total_active,
+                        reasoning_count,
                         elapsed,
                     )
+                    next_progress_log += progress_interval
 
             # Stream completed
             latency = time.time() - start
@@ -193,10 +198,11 @@ class LLMAgent:
 
             logger.info(
                 "[STREAM_END] task=%s | worker=%s | total_tokens=%d | "
-                "ttft=%.2fs | latency=%.1fs | answer=%s",
+                "reasoning_tokens=%d | ttft=%.2fs | latency=%.1fs | answer=%s",
                 task_id,
                 worker_id,
                 token_count,
+                reasoning_count,
                 ttft if ttft is not None else -1,
                 latency,
                 answer[:80],
