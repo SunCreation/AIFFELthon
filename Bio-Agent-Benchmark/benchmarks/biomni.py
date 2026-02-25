@@ -47,7 +47,7 @@ class BiomniBenchmark(BaseBenchmark):
 
     def run_task(self, agent: Any, task: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            response = agent.predict(task["prompt"])
+            response = agent.predict(task["prompt"], task_id=task["id"])
             return {
                 "task_id": task["id"],
                 "status": "success",
