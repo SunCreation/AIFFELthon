@@ -3,6 +3,8 @@
 벤치마크 실시간 모니터링 스크립트.
 로그 파일을 tail -f 하면서 핵심 지표를 실시간 요약합니다.
 
+Streaming/non-streaming 모드 모두 지원.
+
 사용법:
     python monitor.py /tmp/biomni_parallel_run.log
     python monitor.py /tmp/biomni_parallel_run.log --refresh 5
@@ -12,26 +14,96 @@ import sys
 import re
 import time
 import argparse
+from typing import Optional
 from collections import defaultdict
 from datetime import datetime
 
 
-def parse_log_line(line: str) -> dict | None:
+def parse_log_line(line):
+    # type: (str) -> Optional[dict]
     """로그 한 줄을 파싱하여 이벤트 딕셔너리 반환."""
 
-    # [REQ] task=gwas_134 | worker=Thread-1 | prompt_chars=1523
+    # [REQ] task=gwas_134 | worker=Thread-1 | prompt_chars=1523 | mode=stream
     req_match = re.search(
         r"\[REQ\] task=(\S+) \| worker=(\S+) \| prompt_chars=(\d+)", line
     )
     if req_match:
+        mode_match = re.search(r"mode=(\S+)", line)
         return {
             "event": "req",
             "task_id": req_match.group(1),
             "worker": req_match.group(2),
             "prompt_chars": int(req_match.group(3)),
+            "mode": mode_match.group(1) if mode_match else "unknown",
         }
 
-    # [RES] task=gwas_134 | worker=Thread-1 | latency=3.2s | prompt_tokens=412 | completion_tokens=8 | answer=rs123
+    # [STREAM_START] task=gwas_134 | worker=Thread-1 | ttft=0.85s
+    stream_start_match = re.search(
+        r"\[STREAM_START\] task=(\S+) \| worker=(\S+) \| ttft=([\d.]+)s", line
+    )
+    if stream_start_match:
+        return {
+            "event": "stream_start",
+            "task_id": stream_start_match.group(1),
+            "worker": stream_start_match.group(2),
+            "ttft": float(stream_start_match.group(3)),
+        }
+
+    # [STREAM_PROGRESS] task=gwas_134 | worker=Thread-1 | tokens_so_far=20 | elapsed=3.5s
+    stream_progress_match = re.search(
+        r"\[STREAM_PROGRESS\] task=(\S+) \| worker=(\S+) \| "
+        r"tokens_so_far=(\d+) \| elapsed=([\d.]+)s",
+        line,
+    )
+    if stream_progress_match:
+        return {
+            "event": "stream_progress",
+            "task_id": stream_progress_match.group(1),
+            "worker": stream_progress_match.group(2),
+            "tokens_so_far": int(stream_progress_match.group(3)),
+            "elapsed": float(stream_progress_match.group(4)),
+        }
+
+    # [STREAM_STALL] task=hle_55 | worker=Thread-3 | last_token_age=60.0s | tokens_so_far=12
+    stream_stall_match = re.search(r"\[STREAM_STALL\] task=(\S+) \| worker=(\S+)", line)
+    if stream_stall_match:
+        return {
+            "event": "stream_stall",
+            "task_id": stream_stall_match.group(1),
+            "worker": stream_stall_match.group(2),
+        }
+
+    stream_end_match = re.search(
+        r"\[STREAM_END\] task=(\S+) \| worker=(\S+) \| "
+        r"total_tokens=(\d+) \| "
+        r"(?:prompt_tokens=([^|]+) \| )?"
+        r"(?:ttft=([\d.-]+)s \| )?"
+        r"latency=([\d.]+)s \| answer=(.*)",
+        line,
+    )
+    if stream_end_match:
+        prompt_tokens_raw = stream_end_match.group(4)
+        ttft_str = stream_end_match.group(5)
+        prompt_tokens_val = None
+        if prompt_tokens_raw:
+            stripped = prompt_tokens_raw.strip()
+            if stripped.isdigit():
+                prompt_tokens_val = int(stripped)
+        ttft_val = None
+        if ttft_str and ttft_str != "-1":
+            ttft_val = float(ttft_str)
+        return {
+            "event": "stream_end",
+            "task_id": stream_end_match.group(1),
+            "worker": stream_end_match.group(2),
+            "total_tokens": int(stream_end_match.group(3)),
+            "prompt_tokens": prompt_tokens_val,
+            "ttft": ttft_val,
+            "latency": float(stream_end_match.group(6)),
+            "answer": stream_end_match.group(7).strip(),
+        }
+
+    # [RES] (non-streaming mode) task=gwas_134 | worker=Thread-1 | latency=3.2s | ...
     res_match = re.search(
         r"\[RES\] task=(\S+) \| worker=(\S+) \| "
         r"latency=([\d.]+)s \| prompt_tokens=(\d+) \| "
@@ -64,7 +136,7 @@ def parse_log_line(line: str) -> dict | None:
             "error": err_match.group(4).strip(),
         }
 
-    # tqdm progress: Running tasks (x4):  25%|██▌       | 108/433 [05:23<15:02, 2.78s/it]
+    # tqdm progress: Running tasks (x4):  25%|...| 108/433 [05:23<15:02, 2.78s/it]
     tqdm_match = re.search(r"(\d+)/(\d+) \[(\S+)<(\S+)", line)
     if tqdm_match:
         return {
@@ -80,39 +152,68 @@ def parse_log_line(line: str) -> dict | None:
 
 class Monitor:
     def __init__(self):
-        self.active_tasks = {}  # worker -> {task_id, start_time, prompt_chars}
+        # worker -> {task_id, start_time, prompt_chars, tokens, status, ttft}
+        self.active_tasks = {}  # type: dict
         self.completed = 0
         self.errors = 0
+        self.stalls = 0
         self.total_tasks = 0
-        self.latencies = []
+        self.latencies = []  # type: list
+        self.ttfts = []  # type: list
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
-        self.task_type_stats = defaultdict(
-            lambda: {"count": 0, "correct": 0, "total_latency": 0.0}
-        )
+        self.task_type_stats = defaultdict(lambda: {"count": 0, "total_latency": 0.0})
         self.start_time = time.time()
         self.last_progress = ""
         self.slowest_task = ("", 0.0)
-        self.error_list = []
+        self.error_list = []  # type: list
 
-    def process_event(self, event: dict):
-        if event["event"] == "req":
+    def process_event(self, event):
+        # type: (dict) -> None
+        evt = event["event"]
+
+        if evt == "req":
             self.active_tasks[event["worker"]] = {
                 "task_id": event["task_id"],
                 "start_time": time.time(),
                 "prompt_chars": event["prompt_chars"],
+                "tokens": 0,
+                "status": "waiting",  # waiting -> generating -> done
+                "ttft": None,
+                "mode": event.get("mode", "unknown"),
             }
 
-        elif event["event"] == "res":
+        elif evt == "stream_start":
+            worker_info = self.active_tasks.get(event["worker"])
+            if worker_info:
+                worker_info["status"] = "generating"
+                worker_info["ttft"] = event["ttft"]
+
+        elif evt == "stream_progress":
+            worker_info = self.active_tasks.get(event["worker"])
+            if worker_info:
+                worker_info["tokens"] = event["tokens_so_far"]
+                worker_info["status"] = "generating"
+
+        elif evt == "stream_stall":
+            self.stalls += 1
+            worker_info = self.active_tasks.get(event["worker"])
+            if worker_info:
+                worker_info["status"] = "stalled"
+
+        elif evt == "stream_end":
             self.completed += 1
             self.latencies.append(event["latency"])
-            self.total_prompt_tokens += event["prompt_tokens"]
-            self.total_completion_tokens += event["completion_tokens"]
+            if event.get("prompt_tokens") is not None:
+                self.total_prompt_tokens += event["prompt_tokens"]
+            self.total_completion_tokens += event["total_tokens"]
+
+            if event["ttft"] is not None:
+                self.ttfts.append(event["ttft"])
 
             if event["latency"] > self.slowest_task[1]:
                 self.slowest_task = (event["task_id"], event["latency"])
 
-            # task type tracking
             task_type = (
                 event["task_id"].rsplit("_", 1)[0]
                 if "_" in event["task_id"]
@@ -123,25 +224,53 @@ class Monitor:
 
             self.active_tasks.pop(event["worker"], None)
 
-        elif event["event"] == "err":
+        elif evt == "res":
+            # Non-streaming completion
+            self.completed += 1
+            self.latencies.append(event["latency"])
+            self.total_prompt_tokens += event["prompt_tokens"]
+            self.total_completion_tokens += event["completion_tokens"]
+
+            if event["latency"] > self.slowest_task[1]:
+                self.slowest_task = (event["task_id"], event["latency"])
+
+            task_type = (
+                event["task_id"].rsplit("_", 1)[0]
+                if "_" in event["task_id"]
+                else event["task_id"]
+            )
+            self.task_type_stats[task_type]["count"] += 1
+            self.task_type_stats[task_type]["total_latency"] += event["latency"]
+
+            self.active_tasks.pop(event["worker"], None)
+
+        elif evt == "err":
             self.errors += 1
             self.error_list.append((event["task_id"], event["error"][:60]))
             self.active_tasks.pop(event["worker"], None)
 
-        elif event["event"] == "progress":
+        elif evt == "progress":
             self.total_tasks = event["total"]
-            self.last_progress = f"{event['done']}/{event['total']} [{event['elapsed']}<{event['remaining']}]"
+            self.last_progress = "%d/%d [%s<%s]" % (
+                event["done"],
+                event["total"],
+                event["elapsed"],
+                event["remaining"],
+            )
 
-    def render(self) -> str:
+    def render(self):
+        # type: () -> str
         elapsed = time.time() - self.start_time
         avg_latency = sum(self.latencies) / len(self.latencies) if self.latencies else 0
+        avg_ttft = sum(self.ttfts) / len(self.ttfts) if self.ttfts else 0
         total_done = self.completed + self.errors
         throughput = total_done / elapsed * 60 if elapsed > 0 else 0
 
         lines = []
         lines.append("=" * 70)
         lines.append(
-            f"  BENCHMARK MONITOR  |  {datetime.now().strftime('%H:%M:%S')}  |  elapsed: {elapsed:.0f}s"
+            "  BENCHMARK MONITOR  |  %s  |  elapsed: %.0fs"
+            % (datetime.now().strftime("%H:%M:%S"), elapsed)
         )
         lines.append("=" * 70)
 
@@ -157,21 +286,39 @@ class Monitor:
                 else 0
             )
             lines.append(
-                f"  Progress: [{bar}] {pct:.1f}% ({total_done}/{self.total_tasks})"
+                "  Progress: [%s] %.1f%% (%d/%d)"
+                % (bar, pct, total_done, self.total_tasks)
             )
-            lines.append(f"  ETA: {eta:.0f}s | Throughput: {throughput:.1f} tasks/min")
+            lines.append(
+                "  ETA: %.0fs | Throughput: %.1f tasks/min" % (eta, throughput)
+            )
         else:
-            lines.append(f"  Progress: {self.last_progress}")
+            lines.append("  Progress: %s" % self.last_progress)
 
         lines.append("-" * 70)
 
         # Stats
-        lines.append(f"  ✅ Completed: {self.completed}  |  ❌ Errors: {self.errors}")
         lines.append(
-            f"  ⏱  Avg latency: {avg_latency:.1f}s  |  Slowest: {self.slowest_task[0]} ({self.slowest_task[1]:.1f}s)"
+            "  ✅ Completed: %d  |  ❌ Errors: %d  |  ⛔ Stalls: %d"
+            % (self.completed, self.errors, self.stalls)
         )
         lines.append(
-            f"  📊 Tokens — prompt: {self.total_prompt_tokens:,}  |  completion: {self.total_completion_tokens:,}"
+            "  ⏱  Avg latency: %.1fs  |  Slowest: %s (%.1fs)"
+            % (avg_latency, self.slowest_task[0], self.slowest_task[1])
+        )
+        if self.ttfts:
+            lines.append(
+                "  ⚡ Avg TTFT: %.2fs  |  Min: %.2fs  |  Max: %.2fs"
+                % (avg_ttft, min(self.ttfts), max(self.ttfts))
+            )
+        lines.append(
+            "  📊 Tokens — completion: %s  |  prompt: %s"
+            % (
+                "{:,}".format(self.total_completion_tokens),
+                "{:,}".format(self.total_prompt_tokens)
+                if self.total_prompt_tokens
+                else "N/A (streaming)",
+            )
         )
 
         # Active workers
@@ -180,12 +327,53 @@ class Monitor:
         if self.active_tasks:
             for worker, info in self.active_tasks.items():
                 running_for = time.time() - info["start_time"]
-                status = "⚠️ SLOW" if running_for > 30 else "🔄"
+                tokens = info.get("tokens", 0)
+                status_str = info.get("status", "waiting")
+
+                if status_str == "stalled":
+                    icon = "⛔ STALL"
+                elif status_str == "generating":
+                    icon = "🔄"
+                elif running_for > 30 and status_str == "waiting":
+                    icon = "⚠️ SLOW"
+                else:
+                    icon = "🔄"
+
                 worker_short = worker.split("_")[-1] if "_" in worker else worker
-                lines.append(
-                    f"    {status} {worker_short}: {info['task_id']} "
-                    f"({info['prompt_chars']} chars) — {running_for:.0f}s"
-                )
+
+                if status_str == "generating":
+                    ttft_str = (
+                        "ttft=%.1fs, " % info["ttft"]
+                        if info.get("ttft") is not None
+                        else ""
+                    )
+                    lines.append(
+                        "    %s %s: %s — %.0fs, %s%d tokens, generating..."
+                        % (
+                            icon,
+                            worker_short,
+                            info["task_id"],
+                            running_for,
+                            ttft_str,
+                            tokens,
+                        )
+                    )
+                elif status_str == "stalled":
+                    lines.append(
+                        "    %s %s: %s — %.0fs, %d tokens, STALLED!"
+                        % (icon, worker_short, info["task_id"], running_for, tokens)
+                    )
+                else:
+                    lines.append(
+                        "    %s %s: %s (%d chars) — %.0fs, waiting for first token..."
+                        % (
+                            icon,
+                            worker_short,
+                            info["task_id"],
+                            info["prompt_chars"],
+                            running_for,
+                        )
+                    )
         else:
             lines.append("    (none)")
 
@@ -197,20 +385,23 @@ class Monitor:
                 avg = (
                     stats["total_latency"] / stats["count"] if stats["count"] > 0 else 0
                 )
-                lines.append(f"    {ttype}: {stats['count']} done, avg {avg:.1f}s")
+                lines.append(
+                    "    %s: %d done, avg %.1fs" % (ttype, stats["count"], avg)
+                )
 
         # Recent errors
         if self.error_list:
             lines.append("-" * 70)
             lines.append("  RECENT ERRORS:")
             for task_id, err in self.error_list[-3:]:
-                lines.append(f"    ❌ {task_id}: {err}")
+                lines.append("    ❌ %s: %s" % (task_id, err))
 
         lines.append("=" * 70)
         return "\n".join(lines)
 
 
-def tail_and_monitor(filepath: str, refresh: float = 3.0):
+def tail_and_monitor(filepath, refresh=3.0):
+    # type: (str, float) -> None
     """로그 파일을 tail -f 하면서 모니터링."""
     monitor = Monitor()
 
@@ -240,7 +431,7 @@ def tail_and_monitor(filepath: str, refresh: float = 3.0):
                     print("\033[2J\033[H" + monitor.render(), flush=True)
 
     except FileNotFoundError:
-        print(f"Error: Log file not found: {filepath}")
+        print("Error: Log file not found: %s" % filepath)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nMonitoring stopped.")
