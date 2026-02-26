@@ -16,6 +16,7 @@ from benchmarks.biomni import BiomniBenchmark
 from benchmarks.labbench import LabBenchBenchmark
 from agent.mock import MockAgent
 from agent.llm import LLMAgent
+from agent.biomni_a1 import BiomniA1Agent
 from storage.schemas import BenchmarkResult
 from storage.saver import ResultSaver
 
@@ -52,11 +53,13 @@ class ExperimentRunner:
         else:
             raise ValueError(f"Unknown benchmark: {name}")
 
-    def get_agent(self, name: str) -> Any:
+    def get_agent(self, name: str, **agent_kwargs) -> Any:
         if name.lower() == "mock":
             return MockAgent()
         elif name.lower() == "llm":
             return LLMAgent()
+        elif name.lower() == "biomni_a1":
+            return BiomniA1Agent(**agent_kwargs)
         else:
             raise ValueError(f"Unknown agent: {name}")
 
@@ -67,6 +70,7 @@ class ExperimentRunner:
         limit: Optional[int] = None,
         use_wandb: bool = True,
         parallel: int = 0,
+        agent_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -94,7 +98,7 @@ class ExperimentRunner:
                 },
             )
         benchmark = self.get_benchmark(benchmark_name, **kwargs)
-        agent = self.get_agent(agent_name)
+        agent = self.get_agent(agent_name, **(agent_kwargs or {}))
         tasks = benchmark.load_tasks()
         if limit:
             tasks = tasks[:limit]

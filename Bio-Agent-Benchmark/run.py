@@ -26,21 +26,37 @@ class BioAgentBenchmarkCLI:
         use_wandb: bool = True,
         subset: str = "all",
         parallel: int = 0,
+        biomni_path: str = None,
+        biomni_data_path: str = None,
+        skip_datalake: bool = False,
     ):
         """
         벤치마크 실행
         Args:
             benchmark (str): 실행할 벤치마크 이름 (biomni, labbench 등)
-            agent (str): 실행할 에이전트 이름 (mock, llm 등)
+            agent (str): 실행할 에이전트 이름 (mock, llm, biomni_a1)
             limit (int): 실행할 태스크 수 제한 (테스트용)
             use_wandb (bool): W&B 로깅 사용 여부
             subset (str): Lab-bench 실행 시 특정 서브셋 지정 (기본값: all)
             parallel (int): 병렬 워커 수 (0=순차, 4=4개 동시 실행)
+            biomni_path (str): Biomni 레포 경로 (biomni_a1 에이전트 전용)
+            biomni_data_path (str): Biomni 데이터 경로 (biomni_a1 에이전트 전용)
+            skip_datalake (bool): data_lake 다운로드 건너뛰기 (이미 다운로드된 경우)
         """
         mode = f"parallel x{parallel}" if parallel > 0 else "sequential"
         print(f"\U0001f680 Initializing Benchmark: {benchmark} | Agent: {agent} | Subset: {subset} | Mode: {mode}")
         runner = ExperimentRunner()
         analyzer = Analyzer()
+        # Build agent_kwargs for biomni_a1 agent
+        agent_kwargs = {}
+        if agent.lower() == "biomni_a1":
+            if biomni_path:
+                agent_kwargs["biomni_path"] = biomni_path
+            if biomni_data_path:
+                agent_kwargs["data_path"] = biomni_data_path
+            if skip_datalake:
+                agent_kwargs["skip_datalake_download"] = True
+
         try:
             summary = runner.run_benchmark(
                 benchmark_name=benchmark,
@@ -48,6 +64,7 @@ class BioAgentBenchmarkCLI:
                 limit=limit,
                 use_wandb=use_wandb,
                 parallel=parallel,
+                agent_kwargs=agent_kwargs if agent_kwargs else None,
                 subset=subset,
             )
 
