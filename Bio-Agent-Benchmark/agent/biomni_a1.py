@@ -155,7 +155,7 @@ class BiomniA1Agent:
         """
         worker = threading.current_thread().name
         logger.info(
-            "[A1_REQ] task=%s | worker=%s | prompt_chars=%d",
+            "[REQ] task=%s | worker=%s | prompt_chars=%d | mode=non-stream",
             task_id,
             worker,
             len(prompt),
@@ -173,11 +173,18 @@ class BiomniA1Agent:
             clean_answer = self._extract_answer(answer, task_type)
 
             logger.info(
-                "[A1_RES] task=%s | type=%s | worker=%s | latency=%.1fs | steps=%d | raw=%s | clean=%s",
+                "[RES] task=%s | worker=%s | latency=%.1fs | prompt_tokens=%d | completion_tokens=%d | answer=%s",
                 task_id,
-                task_type,
                 worker,
                 latency,
+                len(prompt) // 4,
+                len(clean_answer) // 4,
+                clean_answer,
+            )
+            logger.debug(
+                "[A1_DETAIL] task=%s | type=%s | steps=%d | raw=%s | clean=%s",
+                task_id,
+                task_type,
                 len(log),
                 str(answer)[:60],
                 clean_answer[:80],
@@ -187,7 +194,7 @@ class BiomniA1Agent:
         except Exception as e:
             latency = time.time() - start
             logger.error(
-                "[A1_ERR] task=%s | worker=%s | latency=%.1fs | error=%s: %s",
+                "[ERR] task=%s | worker=%s | latency=%.1fs | error=%s: %s",
                 task_id,
                 worker,
                 latency,
