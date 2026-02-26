@@ -143,49 +143,112 @@ class BiomniA1Agent:
         self._lock = threading.Lock()
 
     def predict(self, prompt, task_id="unknown"):
-        """Run the Biomni A1 agent on the given prompt.
-        1. Uses ToolRetriever to select relevant tools from 223 available
-        2. Runs LangGraph workflow with tool execution capabilities
-        3. Returns the final answer
+        """Run the Biomni A1 agent on the given prompt with token-level streaming.
+
+        Uses LangGraph stream_mode=["messages", "values"] to get token-level
+        chunks, emitting [STREAM_START], [STREAM_PROGRESS], [STREAM_END] events
+        that the web dashboard monitor can parse for real-time display.
+
         Args:
             prompt: The benchmark question/prompt.
             task_id: Identifier for logging.
         Returns:
             str: The agent's answer.
         """
+        from langchain_core.messages import HumanMessage
+
         worker = threading.current_thread().name
         logger.info(
-            "[REQ] task=%s | worker=%s | prompt_chars=%d | mode=non-stream",
+            "[REQ] task=%s | worker=%s | prompt_chars=%d | mode=stream",
             task_id,
             worker,
             len(prompt),
         )
         start = time.time()
-        # Determine task type from task_id for answer extraction
         task_type = self._get_task_type(task_id)
 
         try:
             # A1 is NOT thread-safe (LangGraph state), so serialize access
             with self._lock:
-                log, answer = self._a1.go(prompt)
+                # Replicate A1.go() setup without modifying Biomni source
+                self._a1.critic_count = 0
+                self._a1.user_task = prompt
+                if self._a1.use_tool_retriever:
+                    selected = self._a1._prepare_resources_for_retrieval(prompt)
+                    self._a1.update_system_prompt_with_selected_resources(selected)
+
+                inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
+                config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+                self._a1.log = []
+
+                token_count = 0
+                reasoning_count = 0
+                ttft = None
+                step_count = 0
+                answer = ""
+                progress_interval = 5
+                next_progress = progress_interval
+
+                for mode, data in self._a1.app.stream(
+                    inputs, stream_mode=["messages", "values"], config=config
+                ):
+                    if mode == "messages":
+                        chunk, metadata = data
+                        content = getattr(chunk, "content", "") or ""
+                        reasoning = getattr(chunk, "reasoning_content", "") or ""
+
+                        if content:
+                            token_count += 1
+                        if reasoning:
+                            reasoning_count += 1
+
+                        if content or reasoning:
+                            now = time.time()
+                            if ttft is None:
+                                ttft = now - start
+                                logger.info(
+                                    "[STREAM_START] task=%s | worker=%s | ttft=%.2fs",
+                                    task_id, worker, ttft,
+                                )
+
+                            total = token_count + reasoning_count
+                            if total >= next_progress:
+                                logger.info(
+                                    "[STREAM_PROGRESS] task=%s | worker=%s | tokens_so_far=%d | reasoning=%d | elapsed=%.1fs",
+                                    task_id, worker, total, reasoning_count, now - start,
+                                )
+                                next_progress += progress_interval
+
+                    elif mode == "values":
+                        step_count += 1
+                        message = data["messages"][-1]
+                        answer = message.content
+                        # Preserve A1 log for compatibility
+                        try:
+                            from biomni.utils.utils import pretty_print
+                            out = pretty_print(message)
+                            self._a1.log.append(out)
+                        except ImportError:
+                            self._a1.log.append(str(message.content)[:200])
+
             latency = time.time() - start
-            # Clean the answer based on task type
             clean_answer = self._extract_answer(answer, task_type)
 
             logger.info(
-                "[RES] task=%s | worker=%s | latency=%.1fs | prompt_tokens=%d | completion_tokens=%d | answer=%s",
+                "[STREAM_END] task=%s | worker=%s | total_tokens=%d | reasoning_tokens=%d | ttft=%.2fs | latency=%.1fs | answer=%s",
                 task_id,
                 worker,
+                token_count,
+                reasoning_count,
+                ttft if ttft is not None else -1,
                 latency,
-                len(prompt) // 4,
-                len(clean_answer) // 4,
                 clean_answer,
             )
             logger.debug(
                 "[A1_DETAIL] task=%s | type=%s | steps=%d | raw=%s | clean=%s",
                 task_id,
                 task_type,
-                len(log),
+                step_count,
                 str(answer)[:60],
                 clean_answer[:80],
             )

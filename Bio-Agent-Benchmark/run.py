@@ -23,7 +23,7 @@ class BioAgentBenchmarkCLI:
         benchmark: str = "biomni",
         agent: str = "mock",
         limit: int = None,
-        use_wandb: bool = True,
+        use_wandb: bool = False,
         subset: str = "all",
         parallel: int = 0,
         biomni_path: str = None,
