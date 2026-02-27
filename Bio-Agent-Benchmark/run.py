@@ -56,6 +56,8 @@ class BioAgentBenchmarkCLI:
                 agent_kwargs["data_path"] = biomni_data_path
             if skip_datalake:
                 agent_kwargs["skip_datalake_download"] = True
+            if parallel > 0:
+                agent_kwargs["pool_size"] = parallel
 
         try:
             summary = runner.run_benchmark(

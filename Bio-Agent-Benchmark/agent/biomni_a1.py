@@ -18,6 +18,7 @@ import re
 import time
 import logging
 import threading
+import queue
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -46,6 +47,7 @@ class BiomniA1Agent:
         use_tool_retriever: bool = True,
         timeout_seconds: int = 600,
         skip_datalake_download: bool = False,
+        pool_size: int = 1,
     ):
         """Initialize BiomniA1Agent.
 
@@ -62,6 +64,7 @@ class BiomniA1Agent:
             timeout_seconds: Timeout for code execution in seconds.
             skip_datalake_download: If True, skip downloading data_lake files
                                     (assumes they are already present).
+            pool_size: Number of A1 instances for parallel execution (default 1).
         """
         # Resolve Biomni repo path
         if biomni_path is None:
@@ -132,15 +135,16 @@ class BiomniA1Agent:
         if skip_datalake_download:
             a1_kwargs["expected_data_lake_files"] = []
 
-        # Initialize A1 (this may trigger data_lake download on first run)
-        init_start = time.time()
-        self._a1 = A1(**a1_kwargs)
-        init_time = time.time() - init_start
-        logger.info("Biomni A1 initialized in %.1fs", init_time)
-
-        # Thread lock for A1.go() which is not thread-safe
-        # (LangGraph state is shared within the A1 instance)
-        self._lock = threading.Lock()
+        # Create pool of A1 instances for true parallel execution
+        self._pool = queue.Queue()
+        logger.info("Creating %d A1 instance(s) for parallel execution...", pool_size)
+        for i in range(pool_size):
+            init_start = time.time()
+            a1 = A1(**a1_kwargs)
+            init_time = time.time() - init_start
+            self._pool.put(a1)
+            logger.info("  A1 instance %d/%d initialized in %.1fs", i + 1, pool_size, init_time)
+        logger.info("All %d A1 instance(s) ready", pool_size)
 
     def predict(self, prompt, task_id="unknown"):
         """Run the Biomni A1 agent on the given prompt with token-level streaming.
@@ -168,18 +172,19 @@ class BiomniA1Agent:
         task_type = self._get_task_type(task_id)
 
         try:
-            # A1 is NOT thread-safe (LangGraph state), so serialize access
-            with self._lock:
+            # Get an A1 instance from the pool (blocks until one is available)
+            a1 = self._pool.get()
+            try:
                 # Replicate A1.go() setup without modifying Biomni source
-                self._a1.critic_count = 0
-                self._a1.user_task = prompt
-                if self._a1.use_tool_retriever:
-                    selected = self._a1._prepare_resources_for_retrieval(prompt)
-                    self._a1.update_system_prompt_with_selected_resources(selected)
+                a1.critic_count = 0
+                a1.user_task = prompt
+                if a1.use_tool_retriever:
+                    selected = a1._prepare_resources_for_retrieval(prompt)
+                    a1.update_system_prompt_with_selected_resources(selected)
 
                 inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
-                config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
-                self._a1.log = []
+                config = {"recursion_limit": 500, "configurable": {"thread_id": task_id}}
+                a1.log = []
 
                 token_count = 0
                 reasoning_count = 0
@@ -189,7 +194,7 @@ class BiomniA1Agent:
                 progress_interval = 50
                 next_progress = progress_interval
 
-                for mode, data in self._a1.app.stream(
+                for mode, data in a1.app.stream(
                     inputs, stream_mode=["messages", "values"], config=config
                 ):
                     if mode == "messages":
@@ -227,10 +232,12 @@ class BiomniA1Agent:
                         try:
                             from biomni.utils.utils import pretty_print
                             out = pretty_print(message)
-                            self._a1.log.append(out)
+                            a1.log.append(out)
                         except ImportError:
-                            self._a1.log.append(str(message.content)[:200])
-
+                            a1.log.append(str(message.content)[:200])
+            finally:
+                # Always return A1 instance to pool
+                self._pool.put(a1)
             latency = time.time() - start
             clean_answer = self._extract_answer(answer, task_type)
 
