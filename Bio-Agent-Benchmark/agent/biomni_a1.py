@@ -186,7 +186,7 @@ class BiomniA1Agent:
                 ttft = None
                 step_count = 0
                 answer = ""
-                progress_interval = 5
+                progress_interval = 50
                 next_progress = progress_interval
 
                 for mode, data in self._a1.app.stream(
