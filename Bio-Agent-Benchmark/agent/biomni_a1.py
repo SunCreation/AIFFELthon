@@ -193,6 +193,8 @@ class BiomniA1Agent:
                 answer = ""
                 progress_interval = 50
                 next_progress = progress_interval
+                tools_called = []  # Track tool calls (parsed from <execute> code)
+                seen_execute_blocks = set()  # Deduplicate code blocks
 
                 for mode, data in a1.app.stream(
                     inputs, stream_mode=["messages", "values"], config=config
@@ -228,6 +230,35 @@ class BiomniA1Agent:
                         step_count += 1
                         message = data["messages"][-1]
                         answer = message.content
+
+                        # --- Tool call detection from <execute> code blocks ---
+                        # Biomni A1 uses XML-tag code execution, NOT LangGraph tool_calls.
+                        # The LLM emits <execute>python_code</execute> which the 'execute'
+                        # node runs via REPL. Tool functions are called INSIDE that code.
+                        msg_content = str(message.content) if message.content else ""
+                        execute_blocks = re.findall(
+                            r"<execute>(.*?)</execute>", msg_content, re.DOTALL
+                        )
+                        for code_block in execute_blocks:
+                            block_hash = hash(code_block.strip())
+                            if block_hash in seen_execute_blocks:
+                                continue
+                            seen_execute_blocks.add(block_hash)
+                            try:
+                                new_tools = a1._parse_tool_calls_from_code(code_block)
+                                for tool_name in new_tools:
+                                    if tool_name not in tools_called:
+                                        tools_called.append(tool_name)
+                                        logger.info(
+                                            "[TOOL_CALL] task=%s | worker=%s | tool=%s | step=%d | elapsed=%.1fs",
+                                            task_id, worker, tool_name, step_count, time.time() - start,
+                                        )
+                            except Exception as e:
+                                logger.debug(
+                                    "[TOOL_PARSE_ERR] task=%s | error=%s",
+                                    task_id, e,
+                                )
+
                         # Preserve A1 log for compatibility
                         try:
                             from biomni.utils.utils import pretty_print
@@ -242,13 +273,14 @@ class BiomniA1Agent:
             clean_answer = self._extract_answer(answer, task_type)
 
             logger.info(
-                "[STREAM_END] task=%s | worker=%s | total_tokens=%d | reasoning_tokens=%d | ttft=%.2fs | latency=%.1fs | answer=%s",
+                "[STREAM_END] task=%s | worker=%s | total_tokens=%d | reasoning_tokens=%d | ttft=%.2fs | latency=%.1fs | tools=%s | answer=%s",
                 task_id,
                 worker,
                 token_count,
                 reasoning_count,
                 ttft if ttft is not None else -1,
                 latency,
+                ",".join(tools_called) if tools_called else "none",
                 clean_answer,
             )
             logger.debug(
