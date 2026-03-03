@@ -23,8 +23,9 @@ def parse_log_line(line: str) -> Optional[dict]:
     """로그 한 줄을 파싱하여 이벤트 딕셔너리 반환."""
 
     # [REQ] task=gwas_134 | worker=Thread-1 | prompt_chars=1523 | mode=stream
+    # [MULTI] task=gwas_134 | worker=Thread-1 | task_name=gwas_variant_prioritization | prompt_chars=362
     req_match = re.search(
-        r"\[REQ\] task=(\S+) \| worker=(\S+) \| prompt_chars=(\d+)", line
+        r"\[(?:REQ|MULTI)\] task=(\S+) \| worker=(\S+) .*?prompt_chars=(\d+)", line
     )
     if req_match:
         mode_match = re.search(r"mode=(\S+)", line)
@@ -33,7 +34,7 @@ def parse_log_line(line: str) -> Optional[dict]:
             "task_id": req_match.group(1),
             "worker": req_match.group(2),
             "prompt_chars": int(req_match.group(3)),
-            "mode": mode_match.group(1) if mode_match else "unknown",
+            "mode": mode_match.group(1) if mode_match else "stream",
         }
 
     # [STREAM_START] task=gwas_134 | worker=Thread-1 | ttft=0.85s
@@ -73,13 +74,18 @@ def parse_log_line(line: str) -> Optional[dict]:
             "worker": stream_stall_match.group(2),
         }
 
+    # [STREAM_END] task=X | worker=Y | total_tokens=N | ... | latency=Ns | answer=...
+    # Also handles multi-agent format with task_name=..., tools=... fields
     stream_end_match = re.search(
         r"\[STREAM_END\] task=(\S+) \| worker=(\S+) \| "
+        r"(?:task_name=\S+ \| )?"
         r"total_tokens=(\d+) \| "
         r"(?:reasoning_tokens=(\d+) \| )?"
         r"(?:prompt_tokens=([^|]+) \| )?"
         r"(?:ttft=([\d.-]+)s \| )?"
-        r"latency=([\d.]+)s \| answer=(.*)",
+        r"latency=([\d.]+)s \| "
+        r"(?:tools=\S+ \| )?"
+        r"answer=(.*)",
         line,
     )
     if stream_end_match:
@@ -139,6 +145,72 @@ def parse_log_line(line: str) -> Optional[dict]:
             "error": err_match.group(4).strip(),
         }
 
+    # [SPECIALIST_START] task=X | worker=Y | ttft=Zs
+    # [SPECIALIST_V2_START] task=X | worker=Y | ttft=Zs
+    specialist_start_match = re.search(
+        r"\[SPECIALIST(?:_V2)?_START\] task=(\S+) \| worker=(\S+) \| ttft=([\d.]+)s", line
+    )
+    if specialist_start_match:
+        return {
+            "event": "stream_start",
+            "task_id": specialist_start_match.group(1),
+            "worker": specialist_start_match.group(2),
+            "ttft": float(specialist_start_match.group(3)),
+        }
+
+    # [SPECIALIST_PROGRESS] task=X | tokens=N | reasoning=N | elapsed=Ns
+    # [SPECIALIST_V2_PROGRESS] task=X | tokens=N | reasoning=N | elapsed=Ns
+    specialist_prog_match = re.search(
+        r"\[SPECIALIST(?:_V2)?_PROGRESS\] task=(\S+) \| tokens=(\d+) \| reasoning=(\d+) \| elapsed=([\d.]+)s",
+        line,
+    )
+    if specialist_prog_match:
+        return {
+            "event": "stream_progress",
+            "task_id": specialist_prog_match.group(1),
+            "worker": "specialist",
+            "tokens_so_far": int(specialist_prog_match.group(2)),
+            "reasoning_tokens": int(specialist_prog_match.group(3)),
+            "elapsed": float(specialist_prog_match.group(4)),
+        }
+
+    # [SPECIALIST_END] task=X | specialist=Y | tokens=N | reasoning=N | ttft=Ns | latency=Ns | steps=N | tools=X | answer=...
+    # [SPECIALIST_V2_END] task=X | specialist=Y | tokens=N | reasoning=N | ttft=Ns | latency=Ns | steps=N | tools=X | answer=...
+    specialist_end_match = re.search(
+        r"\[SPECIALIST(?:_V2)?_END\] task=(\S+) \| specialist=(\S+) \| "
+        r"tokens=(\d+) \| reasoning=(\d+) \| "
+        r"ttft=([\d.-]+)s \| latency=([\d.]+)s \| "
+        r"steps=(\d+) \| tools=(\S+) \| answer=(.*)",
+        line,
+    )
+    if specialist_end_match:
+        ttft_str = specialist_end_match.group(5)
+        ttft_val = float(ttft_str) if ttft_str != "-1" else None
+        return {
+            "event": "stream_end",
+            "task_id": specialist_end_match.group(1),
+            "worker": "specialist",
+            "total_tokens": int(specialist_end_match.group(3)),
+            "reasoning_tokens": int(specialist_end_match.group(4)),
+            "prompt_tokens": None,
+            "ttft": ttft_val,
+            "latency": float(specialist_end_match.group(6)),
+            "answer": specialist_end_match.group(9).strip(),
+        }
+
+    # [SPECIALIST_ERR] task=X | latency=Ns | error=...
+    specialist_err_match = re.search(
+        r"\[SPECIALIST(?:_V2)?_ERR\] task=(\S+) \| latency=([\d.]+)s \| error=(.*)",
+        line,
+    )
+    if specialist_err_match:
+        return {
+            "event": "err",
+            "task_id": specialist_err_match.group(1),
+            "worker": "specialist",
+            "latency": float(specialist_err_match.group(2)),
+            "error": specialist_err_match.group(3).strip(),
+        }
 
     # [SCORE] task=gwas_variant_prioritization_134 | score=1.0 | prediction=rs4253311 | ground_truth=rs4253311
     score_match = re.search(

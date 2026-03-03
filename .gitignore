@@ -29,3 +29,12 @@ data/
 .vscode/
 .idea/
 .DS_Store
+
+# Large binary files
+*.sqlite
+
+# Experiment results (large)
+results/
+
+# Lock files
+uv.lock

@@ -34,7 +34,7 @@ class BioAgentBenchmarkCLI:
         벤치마크 실행
         Args:
             benchmark (str): 실행할 벤치마크 이름 (biomni, labbench 등)
-            agent (str): 실행할 에이전트 이름 (mock, llm, biomni_a1)
+            agent (str): 실행할 에이전트 이름 (mock, llm, biomni_a1, biomni_a1_multi)
             limit (int): 실행할 태스크 수 제한 (테스트용)
             use_wandb (bool): W&B 로깅 사용 여부
             subset (str): Lab-bench 실행 시 특정 서브셋 지정 (기본값: all)
@@ -49,7 +49,7 @@ class BioAgentBenchmarkCLI:
         analyzer = Analyzer()
         # Build agent_kwargs for biomni_a1 agent
         agent_kwargs = {}
-        if agent.lower() == "biomni_a1":
+        if agent.lower() in ("biomni_a1", "biomni_a1_multi", "biomni_a1_exp5"):
             if biomni_path:
                 agent_kwargs["biomni_path"] = biomni_path
             if biomni_data_path:
