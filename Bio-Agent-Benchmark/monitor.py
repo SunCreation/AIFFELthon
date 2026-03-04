@@ -192,7 +192,7 @@ def parse_log_line(line: str) -> Optional[dict]:
             "worker": "specialist",
             "total_tokens": int(specialist_end_match.group(3)),
             "reasoning_tokens": int(specialist_end_match.group(4)),
-            "prompt_tokens": None,
+            "prompt_tokens": 0,  # Not tracked in specialist pipeline; streaming chunks only
             "ttft": ttft_val,
             "latency": float(specialist_end_match.group(6)),
             "answer": specialist_end_match.group(9).strip(),

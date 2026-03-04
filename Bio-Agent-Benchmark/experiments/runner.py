@@ -19,6 +19,7 @@ from agent.llm import LLMAgent
 from agent.biomni_a1 import BiomniA1Agent
 from agent.biomni_a1_multi import BiomniA1MultiAgent
 from agent.biomni_a1_exp5 import BiomniA1MultiAgent as BiomniA1Exp5Agent
+from agent.biomni_a1_exp6 import BiomniA1MultiAgent as BiomniA1Exp6Agent
 from storage.schemas import BenchmarkResult
 from storage.saver import ResultSaver
 
@@ -66,6 +67,8 @@ class ExperimentRunner:
             return BiomniA1MultiAgent(**agent_kwargs)
         elif name.lower() == "biomni_a1_exp5":
             return BiomniA1Exp5Agent(**agent_kwargs)
+        elif name.lower() == "biomni_a1_exp6":
+            return BiomniA1Exp6Agent(**agent_kwargs)
         else:
             raise ValueError(f"Unknown agent: {name}")
 

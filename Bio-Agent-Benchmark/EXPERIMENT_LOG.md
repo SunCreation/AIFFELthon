@@ -298,4 +298,170 @@
 - 예상 정확도: ~40-50% (프롬프트 축소 효과)
 
 ### Results
-_실행 대기 중_
+| Task Type | Correct | Total | Accuracy | vs Baseline | vs Exp#4 |
+|---|---|---|---|---|---|
+| gwas_causal_gene_opentargets | 39 | 50 | 78.0% | +4.0pp | 0.0pp |
+| gwas_causal_gene_pharmaprojects | 32 | 50 | 64.0% | -4.0pp | -2.0pp |
+| gwas_causal_gene_gwas_catalog | 26 | 50 | 52.0% | -6.0pp | +4.0pp |
+| screen_gene_retrieval | 22 | 50 | 44.0% | 0.0pp | 0.0pp |
+| lab_bench_seqqa | 14 | 50 | 28.0% | 0.0pp | **-14.0pp** |
+| lab_bench_dbqa | 18 | 50 | 36.0% | +6.0pp | +8.0pp |
+| gwas_variant_prioritization | 3 | 43 | 7.0% | 0.0pp | +4.7pp |
+| crispr_delivery | 1 | 10 | 10.0% | -20.0pp | 0.0pp |
+| patient_gene_detection | 4 | 50 | 8.0% | +6.0pp | -4.0pp |
+| rare_disease_diagnosis | 0 | 30 | 0.0% | 0.0pp | 0.0pp |
+| **OVERALL** | **159** | **433** | **36.7%** | **+0.2pp** | **-0.5pp** |
+
+### Result dir
+`logs/experiments/20260303_173314_biomni_biomni_a1_exp5/`
+
+### Key Observations
+- **프롬프트 27K→2~3.6K 축소만으로는 성능 변화 없음** (36.7% ≈ 36.5% baseline)
+- lab_bench_seqqa: 21→14 (-7건, -14pp) — Exp#4의 개선이 프롬프트 크기가 아닌 다른 요인이었을 가능성
+- lab_bench_dbqa: 14→18 (+4건, +8pp) — 경량 프롬프트가 이 카테고리에서는 효과적
+- gwas_variant_prioritization: 1→3 (Exp#4 대비 +2건) — baseline 수준으로 회복
+- patient_gene_detection: 6→4 (Exp#4 대비 -2건) — TOOL_KNOWLEDGE 없이는 약간 하락
+- **rare_disease_diagnosis: 여전히 0/30** — LLM이 API 호출 없이 추측만 함
+- **★ 핵심 결론**: 컨텍스트 **길이**가 아니라 **질**이 성능의 핵심 요인
+- **→ Exp#6 방향**: specialist 프롬프트에 few-shot 코드 예시 + API 호출 체인 주입으로 질적 개선
+
+---
+
+## Experiment #6: Few-shot Code Examples (IN PROGRESS)
+- **Date**: 2026-03-03
+- **Agent**: `biomni_a1_exp6` (few-shot 코드 예시 포함 specialist)
+- **Config**: 8 workers, 433 tasks, gpt-oss-20b, timeout=600s
+- **File**: `agent/biomni_a1_exp6.py`
+
+### Architecture (Exp#5와 동일한 멀티에이전트 구조, 프롬프트 질 개선)
+```
+[Orchestrator] — 태스크 분류 + 파라미터 추출 + 라우팅
+    ├─ [GWAS Catalog 전문가] — findByRsId 직접 endpoint + 전체 코드 예시
+    ├─ [Monarch 전문가] — patient_gene_detection/rare_disease_diagnosis 단계별 코드 체인
+    ├─ [OpenTargets 전문가] — 기존 유지 (이미 잘 동작)
+    ├─ [Ensembl 전문가] — 기존 유지
+    └─ [Synthesizer] → 전문가 findings 종합 → 최종 답변
+```
+
+### Key Changes from Exp#5 (단일 변수 변경: 프롬프트 질)
+1. **gwas_catalog specialist**: `findByRsId` 직접 endpoint 코드 예시 + p-value 파싱 패턴
+2. **monarch specialist**: patient_gene_detection + rare_disease_diagnosis 전체 단계별 코드 체인
+   - Strategy A: ENSG→gene symbol→Monarch semsim→질병→유전자 매칭
+   - Strategy B: gene lookup→Monarch 질병 검색→HPO 매칭→OMIM ID 추출
+3. **opentarget/ensembl**: 기존 프롬프트 유지 (이미 효과적)
+4. **나머지 로직 동일** — 라우팅, 합성, postprocess 등
+
+### Hypothesis
+- few-shot 코드 예시가 LLM의 도구 사용 패턴을 올바르게 유도
+- gwas_variant_prioritization: 3/43→15+/43 (findByRsId 직접 호출)
+- patient_gene_detection: 4/50→15+/50 (단계별 코드 체인)
+- rare_disease_diagnosis: 0/30→5+/30 (OMIM ID 추출 코드 체인)
+- 예상 정확도: ~40-45%+ (질적 개선 효과)
+
+### Results (v1~v4: 버그 수정 과정, v5: 조기 종료)
+
+#### 버그 수정 이력
+- **v1-v2**: `execute_self_critic`에서 `self.llm.invoke()` 하드코딩 → hang 발생 (수정: 체인 방식으로 변경)
+- **v3**: hang 해결됨. 하지만 0% 정확도 — self_critic 후 generate가 `<solution>` 안에 메타코멘터리를 넣어 답 덮어씀
+- **v4**: answer 보존 로직 추가(3곳) — 반영 안 됨 (프로세스 재시작 이슈). 여전히 0%
+- **v5**: 근본 수정 3건 적용 후 재실행, 조기 종료(23/433)
+
+#### v5 수정 내역 (3건)
+1. **a1.py `execute_self_critic`**: 피드백 프롬프트에 `<solution>` 태그 규칙 강제 추가
+   - "Your <solution> tag MUST contain ONLY the final answer value, NOT critique text"
+   - `print()` → `logging.getLogger()` 변경으로 로그 가시성 확보
+2. **biomni_a1_exp6.py `_is_meta_commentary()`**: 메타코멘터리 필터 함수 추가
+   - 17개 패턴 매칭 ("critique", "prior attempt", "tag simply" 등)
+   - 3곳의 answer 보존 로직에 적용
+3. **llm.py**: `request_timeout=120, max_retries=2` 추가 (이전 세션에서)
+
+#### v5 중간 결과 (조기 종료: 23/433, gwas_variant_prioritization만 실행)
+| 지표 | v4 (수정 전) | v5 (수정 후) |
+|---|---|---|
+| 정답 | 0/21 (0%) | 1/23 (4.3%) |
+| rsID 형식 답변 | ~3/21 | 18/23 |
+| 메타코멘터리 유출 | ~15/21 | 2/23 |
+| [SELF_CRITIC] 로그 | 미출력 | 정상 출력 |
+
+- 메타코멘터리 필터 **작동 확인**: v4의 `tag simply returned...` 류가 v5에서 대부분 제거됨
+- 하지만 `gwas_variant_prioritization` 자체가 baseline에서도 3/43(7%)로 가장 어려운 카테고리
+- **정확한 전체 정확도 비교는 433개 전체 실행 후 가능** (다른 카테고리에서 개선 기대)
+
+#### gwas_variant_prioritization 태스크 분석
+- phenotype 이름 + 후보 rsID 10~11개 리스트 → 가장 유의한 variant 1개 선택
+- GWAS Catalog API에서 phenotype 검색 → p-value 기준 정렬이 핵심 전략
+- baseline(7%) 대비 개선하려면 specialist에 "각 후보 rsID를 개별 조회+p-value 비교" 전략 필요
+
+### Status
+_Exp#6 전체 실행 완료. 아래 결과 참조._
+
+---
+
+## Experiment #6: 5-Tool GWAS Variant Strategy + Enhanced Specialist Prompts + self_critic
+- **Date**: 2026-03-03 ~ 2026-03-04
+- **Agent**: `biomni_a1_exp6` (Exp#5 기반 + gwas_variant specialist 추가)
+- **Config**: 8 workers, 433 tasks, gpt-oss-20b, timeout=600s
+- **Log file**: `logs/exp6_run.log`
+- **Changes from Exp#5**:
+  1. 새 `gwas_variant` specialist 추가 (5개 tool 종합 전략 + trait matching)
+  2. TASK_PIPELINES의 gwas_variant_prioritization에 5개 tool 할당
+  3. sub_prompt_template에 trait matching 강조 ("Do NOT just pick lowest p-value")
+  4. self_critic=True 유지 (Exp#5에서 버그 수정 완료)
+  5. 기존 specialist prompts (monarch, opentargets 등) 유지
+
+### Results
+| Task Type | Correct | Total | Accuracy | vs Baseline | vs Exp#5 |
+|---|---|---|---|---|---|
+| gwas_causal_gene_opentargets | 38 | 50 | 76.0% | -2%p (78%) | -2%p (78%) |
+| gwas_causal_gene_pharmaprojects | 31 | 50 | 62.0% | -6%p (68%) | -2%p (64%) |
+| gwas_causal_gene_gwas_catalog | 25 | 50 | 50.0% | -8%p (58%) | -2%p (52%) |
+| lab_bench_seqqa | **23** | 50 | **46.0%** | **+18%p (28%)** | **+18%p (28%)** |
+| screen_gene_retrieval | 22 | 50 | 44.0% | 0%p (44%) | 0%p (44%) |
+| lab_bench_dbqa | 12 | 50 | 24.0% | -6%p (30%) | -12%p (36%) |
+| patient_gene_detection | **5** | 50 | **10.0%** | **+8%p (2%)** | +2%p (8%) |
+| gwas_variant_prioritization | 2 | 43 | 4.7% | -2.3%p (7%) | -2.3%p (7%) |
+| crispr_delivery | 0 | 10 | 0.0% | -30%p (30%) | -10%p (10%) |
+| rare_disease_diagnosis | 0 | 30 | 0.0% | 0%p (0%) | 0%p (0%) |
+| **OVERALL** | **158** | **433** | **36.5%** | **0%p (36.5%)** | **-0.2%p (36.7%)** |
+
+### Key Observations
+
+#### 개선된 카테고리
+- **lab_bench_seqqa**: 28% → 46% (+18%p) — specialist prompt 개선 + self_critic 효과
+  - 코드 실행이 아닌 지식 질의 태스크라서 프롬프트 품질 개선이 직접 효과
+- **patient_gene_detection**: 2% → 10% (+8%p) — monarch specialist의 다양한 few-shot 코드 예시 효과
+
+#### 하락한 카테고리
+- **gwas_causal_gene_gwas_catalog**: 58% → 50% (-8%p) — specialist prompt 변경 부작용 가능성
+- **gwas_causal_gene_pharmaprojects**: 68% → 62% (-6%p) — 동일
+- **lab_bench_dbqa**: 30% → 24% (-6%p) — 회귀
+- **crispr_delivery**: 30% → 0% (-30%p) — 심각한 회귀
+
+#### gwas_variant_prioritization 실패 분석
+- 2/43 (4.7%) — baseline 3/43 (7%) 대비 오히려 하락
+- **근본 원인**: 20B 모델이 5개 tool 전략을 무시함
+  - 43개 중 36개가 query_gwas_catalog만 사용 (5개 중 1개)
+  - trait matching 코드를 생성하지 못하고 단순 p-value 비교만 수행
+  - 프롬프트가 9286자로 너무 길어 20B 모델이 핵심 전략을 놓침
+- **교훈**: 20B 모델에는 짧고 명확한 프롬프트 + 단일 코드 블록이 효과적
+
+### Comparison Table (All Experiments)
+| Category | Baseline | Exp#3 | Exp#4 | Exp#5 | Exp#6 |
+|---|---|---|---|---|---|
+| gwas_causal_gene_opentargets | 37 (74%) | - | 39 (78%) | 39 (78%) | 38 (76%) |
+| gwas_causal_gene_pharmaprojects | 34 (68%) | - | 33 (66%) | 32 (64%) | 31 (62%) |
+| gwas_causal_gene_gwas_catalog | 29 (58%) | - | 24 (48%) | 26 (52%) | 25 (50%) |
+| screen_gene_retrieval | 22 (44%) | - | 22 (44%) | 22 (44%) | 22 (44%) |
+| lab_bench_seqqa | 14 (28%) | - | 21 (42%) | 14 (28%) | **23 (46%)** |
+| lab_bench_dbqa | 15 (30%) | - | 14 (28%) | 18 (36%) | 12 (24%) |
+| gwas_variant_prioritization | 3 (7%) | - | 1 (2%) | 3 (7%) | 2 (4.7%) |
+| crispr_delivery | 3 (30%) | - | 1 (10%) | 1 (10%) | 0 (0%) |
+| patient_gene_detection | 1 (2%) | - | 6 (12%) | 4 (8%) | **5 (10%)** |
+| rare_disease_diagnosis | 0 (0%) | - | 0 (0%) | 0 (0%) | 0 (0%) |
+| **TOTAL** | **158 (36.5%)** | **153 (35.3%)** | **161 (37.2%)** | **159 (36.7%)** | **158 (36.5%)** |
+
+### Next Steps
+1. gwas_variant_prioritization: 프롬프트를 짧게 줄이고, 단일 코드 블록으로 trait matching 수행하도록 변경
+2. crispr_delivery 회귀 원인 분석 필요 (30% → 0%)
+3. lab_bench_dbqa 회귀 원인 분석
+4. lab_bench_seqqa 개선 요인을 다른 카테고리에도 적용 검토

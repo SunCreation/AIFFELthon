@@ -49,7 +49,7 @@ class BioAgentBenchmarkCLI:
         analyzer = Analyzer()
         # Build agent_kwargs for biomni_a1 agent
         agent_kwargs = {}
-        if agent.lower() in ("biomni_a1", "biomni_a1_multi", "biomni_a1_exp5"):
+        if agent.lower() in ("biomni_a1", "biomni_a1_multi", "biomni_a1_exp5", "biomni_a1_exp6"):
             if biomni_path:
                 agent_kwargs["biomni_path"] = biomni_path
             if biomni_data_path:
